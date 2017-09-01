@@ -76,7 +76,15 @@ class TimestampValue {
         date_(d) {}
   TimestampValue(const boost::posix_time::ptime& t)
       : time_(t.time_of_day()),
-        date_(t.date()) {}
+        date_(t.date()) {
+    if(!date_.is_special() && UNLIKELY(!IsValidDate())){
+      // It is possible to create a ptime value outside the valid date range, which
+      // cannot be handled by some of the member functions, so it must be explicitly
+      // set to not_a_date_time.
+      time_ = boost::posix_time::time_duration(boost::posix_time::not_a_date_time);
+      date_ =  boost::gregorian::date(boost::gregorian::not_a_date_time);
+    }
+  }
   TimestampValue(const TimestampValue& tv) : time_(tv.time_), date_(tv.date_) {}
 
   /// Constructors that parse from a date/time string. See TimestampParser for details
