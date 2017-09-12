@@ -216,6 +216,11 @@ Status ExecEnv::InitForFeTests() {
 Status ExecEnv::StartServices() {
   LOG(INFO) << "Starting global services";
 
+  // Initialize thread pools
+  RETURN_IF_ERROR(exec_rpc_thread_pool_->Init());
+  RETURN_IF_ERROR(async_rpc_pool_->Init());
+  RETURN_IF_ERROR(hdfs_op_thread_pool_->Init());
+
   // Initialize global memory limit.
   // Depending on the system configuration, we will have to calculate the process
   // memory limit either based on the available physical memory, or if overcommitting
@@ -294,7 +299,7 @@ Status ExecEnv::StartServices() {
         BufferPoolMetric::UNUSED_RESERVATION_BYTES));
   obj_pool_->Add(new MemTracker(negated_unused_reservation, -1,
       "Buffer Pool: Unused Reservation", mem_tracker_.get()));
-#ifndef ADDRESS_SANITIZER
+#if !defined(ADDRESS_SANITIZER) && !defined(THREAD_SANITIZER)
   // Aggressive decommit is required so that unused pages in the TCMalloc page heap are
   // not backed by physical pages and do not contribute towards memory consumption.
   size_t aggressive_decommit_enabled = 0;
