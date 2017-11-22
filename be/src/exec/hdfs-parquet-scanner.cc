@@ -209,6 +209,11 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
     const FilterContext* ctx = &context->filter_ctxs()[i];
     DCHECK(ctx->filter != NULL);
     filter_ctxs_.push_back(ctx);
+    const auto& expr = ctx->expr_eval->root();
+    vector<SlotId> slot_ids;
+    if(expr.GetSlotIds(&slot_ids) == 1) {
+      single_column_filter_ctxs_[slot_ids[0]] = ctx;
+    }
   }
   filter_stats_.resize(filter_ctxs_.size());
 
@@ -749,7 +754,9 @@ bool HdfsParquetScanner::IsDictFilterable(ParquetColumnReader* col_reader) {
   if (!slot_desc) return false;
   // Does this column reader have any dictionary filter conjuncts?
   auto dict_filter_it = dict_filter_map_.find(slot_desc->id());
-  if (dict_filter_it == dict_filter_map_.end()) return false;
+  auto runtime_filter_it = single_column_filter_ctxs_.find(slot_desc->id());
+  if (runtime_filter_it == single_column_filter_ctxs_.end()
+    && dict_filter_it == dict_filter_map_.end()) return false;
 
   // Certain datatypes (chars, timestamps) do not have the appropriate value in the
   // file format and must be converted before return. This is true for the
@@ -792,9 +799,8 @@ Status HdfsParquetScanner::InitDictFilterStructures() {
   for (ParquetColumnReader* col_reader : column_readers_) {
     if (dictionary_filtering_enabled && IsDictFilterable(col_reader)) {
       dict_filterable_readers_.push_back(col_reader);
-    } else {
-      non_dict_filterable_readers_.push_back(col_reader);
     }
+    else non_dict_filterable_readers_.push_back(col_reader);
   }
   return Status::OK();
 }
@@ -900,9 +906,16 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
 
     const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
     auto dict_filter_it = dict_filter_map_.find(slot_desc->id());
-    DCHECK(dict_filter_it != dict_filter_map_.end());
-    const vector<ScalarExprEvaluator*>& dict_filter_conjunct_evals =
-        dict_filter_it->second;
+    const vector<ScalarExprEvaluator*>* dict_filter_conjunct_evals =
+        dict_filter_it != dict_filter_map_.end()
+        ? &(dict_filter_it->second) : nullptr;
+
+    auto runtime_filter_it = single_column_filter_ctxs_.find(slot_desc->id());
+    const FilterContext* runtime_filter = runtime_filter_it != single_column_filter_ctxs_.end()
+                                   ? runtime_filter_it->second : nullptr;
+
+    DCHECK(runtime_filter != nullptr || dict_filter_conjunct_evals != nullptr);
+
     void* slot = dict_filter_tuple->GetSlot(slot_desc->tuple_offset());
     bool column_has_match = false;
     for (int dict_idx = 0; dict_idx < dictionary->num_entries(); ++dict_idx) {
@@ -917,12 +930,15 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
       // If any dictionary value passes the conjuncts, then move on to the next column.
       TupleRow row;
       row.SetTuple(0, dict_filter_tuple);
-      if (ExecNode::EvalConjuncts(dict_filter_conjunct_evals.data(),
-              dict_filter_conjunct_evals.size(), &row)) {
+      if ((dict_filter_conjunct_evals == nullptr ||
+         ExecNode::EvalConjuncts(dict_filter_conjunct_evals->data(),
+         dict_filter_conjunct_evals->size(), &row))
+         && (runtime_filter == nullptr || runtime_filter->Eval(&row))) {
         column_has_match = true;
         break;
       }
     }
+
     // Free all expr result allocations now that we're done with the filter.
     context_->expr_results_pool()->Clear();
 

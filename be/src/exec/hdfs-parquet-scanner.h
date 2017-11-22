@@ -395,6 +395,10 @@ class HdfsParquetScanner : public HdfsScanner {
   /// owned by instances of this class.
   vector<const FilterContext*> filter_ctxs_;
 
+  /// Runtime filters that depend on only a single column. These filters can be used
+  /// during dictionary filtering.
+  std::map<SlotId, const FilterContext*> single_column_filter_ctxs_;
+
   struct LocalFilterStats {
     /// Total number of rows to which each filter was applied
     int64_t considered;
