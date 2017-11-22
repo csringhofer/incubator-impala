@@ -395,6 +395,10 @@ class HdfsParquetScanner : public HdfsScanner {
   /// owned by instances of this class.
   vector<const FilterContext*> filter_ctxs_;
 
+  /// Runtime filters that depend on only a single column. These filters can be used
+  /// during dictionary filtering.
+  std::map<SlotId, const FilterContext*> single_column_filter_ctxs_;
+
   struct LocalFilterStats {
     /// Total number of rows to which each filter was applied
     int64_t considered;
@@ -480,6 +484,9 @@ class HdfsParquetScanner : public HdfsScanner {
 
   /// Number of row groups skipped due to dictionary filter
   RuntimeProfile::Counter* num_dict_filtered_row_groups_counter_;
+  
+  /// Number of row groups skipped due to applying runtime filter on dictionaries.
+  RuntimeProfile::Counter* num_runtime_filtered_row_groups_counter_;
 
   /// Number of collection items read in current row batch. It is a scanner-local counter
   /// used to reduce the frequency of updating HdfsScanNode counter. It is updated by the
@@ -656,7 +663,7 @@ class HdfsParquetScanner : public HdfsScanner {
   /// to the dictionary values. Specifically, if any dictionary-encoded column has
   /// no values that pass the relevant conjuncts, then the row group can be skipped.
   Status EvalDictionaryFilters(const parquet::RowGroup& row_group,
-      bool* skip_row_group) WARN_UNUSED_RESULT;
+      bool* skip_row_group, bool* skip_row_group_on_runtime_filter) WARN_UNUSED_RESULT;
 };
 
 } // namespace impala

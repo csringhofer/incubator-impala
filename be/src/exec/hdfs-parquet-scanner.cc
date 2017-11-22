@@ -157,6 +157,7 @@ HdfsParquetScanner::HdfsParquetScanner(HdfsScanNodeBase* scan_node, RuntimeState
     num_row_groups_counter_(NULL),
     num_scanners_with_no_reads_counter_(NULL),
     num_dict_filtered_row_groups_counter_(NULL),
+    num_runtime_filtered_row_groups_counter_(nullptr),
     coll_items_read_counter_(0),
     codegend_process_scratch_batch_fn_(NULL) {
   assemble_rows_timer_.Stop();
@@ -176,6 +177,9 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
       ADD_COUNTER(scan_node_->runtime_profile(), "NumScannersWithNoReads", TUnit::UNIT);
   num_dict_filtered_row_groups_counter_ =
       ADD_COUNTER(scan_node_->runtime_profile(), "NumDictFilteredRowGroups", TUnit::UNIT);
+  num_runtime_filtered_row_groups_counter_ =
+      ADD_COUNTER(scan_node_->runtime_profile(), 
+      "NumRuntimeFilteredRowGroups", TUnit::UNIT);
   process_footer_timer_stats_ =
       ADD_SUMMARY_STATS_TIMER(scan_node_->runtime_profile(), "FooterProcessingTime");
 
@@ -209,6 +213,11 @@ Status HdfsParquetScanner::Open(ScannerContext* context) {
     const FilterContext* ctx = &context->filter_ctxs()[i];
     DCHECK(ctx->filter != NULL);
     filter_ctxs_.push_back(ctx);
+    const auto& expr = ctx->expr_eval->root();
+    vector<SlotId> slot_ids;
+    if(expr.GetSlotIds(&slot_ids) == 1) {
+      single_column_filter_ctxs_[slot_ids[0]] = ctx;
+    }
   }
   filter_stats_.resize(filter_ctxs_.size());
 
@@ -672,8 +681,9 @@ Status HdfsParquetScanner::NextRowGroup() {
     // If there is a dictionary-encoded column where every value is eliminated
     // by a conjunct, the row group can be eliminated. This initializes dictionaries
     // for all columns visited.
-    bool skip_row_group_on_dict_filters;
-    Status status = EvalDictionaryFilters(row_group, &skip_row_group_on_dict_filters);
+    bool skip_row_group_on_dict_filters, skip_row_group_on_runtime_dict_filters;
+    Status status = EvalDictionaryFilters(row_group, &skip_row_group_on_dict_filters,
+         &skip_row_group_on_runtime_dict_filters );
     if (!status.ok()) {
       // Either return an error or skip this row group if it is ok to ignore errors
       RETURN_IF_ERROR(state_->LogOrReturnError(status.msg()));
@@ -681,6 +691,10 @@ Status HdfsParquetScanner::NextRowGroup() {
     }
     if (skip_row_group_on_dict_filters) {
       COUNTER_ADD(num_dict_filtered_row_groups_counter_, 1);
+      continue;
+    }
+    if (skip_row_group_on_runtime_dict_filters) {
+      COUNTER_ADD(num_runtime_filtered_row_groups_counter_, 1);
       continue;
     }
 
@@ -748,7 +762,9 @@ bool HdfsParquetScanner::IsDictFilterable(ParquetColumnReader* col_reader) {
   if (!slot_desc) return false;
   // Does this column reader have any dictionary filter conjuncts?
   auto dict_filter_it = dict_filter_map_.find(slot_desc->id());
-  if (dict_filter_it == dict_filter_map_.end()) return false;
+  auto runtime_filter_it = single_column_filter_ctxs_.find(slot_desc->id());
+  if (runtime_filter_it == single_column_filter_ctxs_.end()
+    && dict_filter_it == dict_filter_map_.end()) return false;
 
   // Certain datatypes (chars, timestamps) do not have the appropriate value in the
   // file format and must be converted before return. This is true for the
@@ -791,9 +807,8 @@ Status HdfsParquetScanner::InitDictFilterStructures() {
   for (ParquetColumnReader* col_reader : column_readers_) {
     if (dictionary_filtering_enabled && IsDictFilterable(col_reader)) {
       dict_filterable_readers_.push_back(col_reader);
-    } else {
-      non_dict_filterable_readers_.push_back(col_reader);
     }
+    else non_dict_filterable_readers_.push_back(col_reader);
   }
   return Status::OK();
 }
@@ -855,9 +870,9 @@ bool HdfsParquetScanner::IsDictionaryEncoded(
 }
 
 Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_group,
-    bool* row_group_eliminated) {
+    bool* row_group_eliminated, bool* skip_row_group_on_runtime_filter) {
   *row_group_eliminated = false;
-
+  *skip_row_group_on_runtime_filter = false;
   // Legacy impala files (< 2.9) require special handling, because they do not encode
   // information about whether the column is 100% dictionary encoded.
   bool is_legacy_impala = false;
@@ -899,9 +914,16 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
 
     const SlotDescriptor* slot_desc = scalar_reader->slot_desc();
     auto dict_filter_it = dict_filter_map_.find(slot_desc->id());
-    DCHECK(dict_filter_it != dict_filter_map_.end());
-    const vector<ScalarExprEvaluator*>& dict_filter_conjunct_evals =
-        dict_filter_it->second;
+    const vector<ScalarExprEvaluator*>* dict_filter_conjunct_evals =
+        dict_filter_it != dict_filter_map_.end()
+        ? &(dict_filter_it->second) : nullptr;
+
+    auto runtime_filter_it = single_column_filter_ctxs_.find(slot_desc->id());
+    const FilterContext* runtime_filter = runtime_filter_it != single_column_filter_ctxs_.end()
+                                   ? runtime_filter_it->second : nullptr;
+
+    DCHECK(runtime_filter != nullptr || dict_filter_conjunct_evals != nullptr);
+
     void* slot = dict_filter_tuple->GetSlot(slot_desc->tuple_offset());
     bool column_has_match = false;
     for (int dict_idx = 0; dict_idx < dictionary->num_entries(); ++dict_idx) {
@@ -916,21 +938,27 @@ Status HdfsParquetScanner::EvalDictionaryFilters(const parquet::RowGroup& row_gr
       // If any dictionary value passes the conjuncts, then move on to the next column.
       TupleRow row;
       row.SetTuple(0, dict_filter_tuple);
-      if (ExecNode::EvalConjuncts(dict_filter_conjunct_evals.data(),
-              dict_filter_conjunct_evals.size(), &row)) {
-        column_has_match = true;
-        break;
+      if (dict_filter_conjunct_evals == nullptr ||
+         ExecNode::EvalConjuncts(dict_filter_conjunct_evals->data(),
+         dict_filter_conjunct_evals->size(), &row)) {
+        *skip_row_group_on_runtime_filter = true; // not because of dict filter
+        if (runtime_filter == nullptr || runtime_filter->Eval(&row)) {
+           column_has_match = true;
+           break;
+        }
       }
     }
+
     // Free all expr result allocations now that we're done with the filter.
     context_->expr_results_pool()->Clear();
 
     if (!column_has_match) {
       // The column contains no value that matches the conjunct. The row group
       // can be eliminated.
-      *row_group_eliminated = true;
+      if (!*skip_row_group_on_runtime_filter) *row_group_eliminated = true;
       return Status::OK();
     }
+    *skip_row_group_on_runtime_filter = false;
   }
 
   // Any columns that were not 100% dictionary encoded need to initialize
